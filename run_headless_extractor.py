@@ -8,6 +8,8 @@ import os
 import subprocess
 from pathlib import Path
 from typing import Optional
+from headless_browser.extraction_cli import interactive_mode
+from headless_browser.headless_extractor import cleanup_and_rebuild_docker, verify_docker_image, DockerStatusUpdater
 
 
 def run_headless_extraction(
@@ -120,30 +122,42 @@ def run_headless_extraction(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Run headless web data extraction using Claude")
-    parser.add_argument("--url", required=True, help="URL to extract data from")
-    parser.add_argument("--instructions", required=True, help="Extraction instructions for Claude")
-    parser.add_argument("--output", default="extraction_results.json", help="Output filename")
-    parser.add_argument("--format", default="json", choices=["json", "csv", "txt"], help="Output format")
-    parser.add_argument("--provider", default="anthropic", choices=["anthropic", "bedrock", "vertex"], help="API provider")
-    parser.add_argument("--api-key", help="API key (if not set in environment)")
-    parser.add_argument("--model", default="claude-3-7-sonnet-20250219", help="Model to use")
-    parser.add_argument("--tool-version", default="computer_use_20250124", help="Tool version to use")
-    parser.add_argument("--shared-dir", help="Directory to mount as shared volume (defaults to ./shared)")
-    
-    args = parser.parse_args()
-    
-    return run_headless_extraction(
-        url=args.url,
-        instructions=args.instructions,
-        output=args.output,
-        format=args.format,
-        api_provider=args.provider,
-        api_key=args.api_key,
-        model=args.model,
-        tool_version=args.tool_version,
-        shared_dir=args.shared_dir,
-    )
+    # Prompt for Docker cleanup and rebuild
+    try:
+        response = input("\nDo you want to clean and rebuild your docker image? [Y/n] ").lower()
+        if response in ['', 'y', 'yes']:
+            if not cleanup_and_rebuild_docker():
+                status = DockerStatusUpdater()
+                status.start()
+                status.log_docker(
+                    "Failed to rebuild Docker image. Attempting to proceed with existing image...",
+                    "warning"
+                )
+                # Verify we have a usable image
+                if not verify_docker_image("headless-browser:latest", status):
+                    status.log_docker(
+                        "No usable Docker image found. Please fix Docker issues before proceeding.",
+                        "error"
+                    )
+                    status.stop()
+                    return 1
+                status.stop()
+    except Exception as e:
+        status = DockerStatusUpdater()
+        status.start()
+        status.log_docker("Error during Docker cleanup prompt", "error", e)
+        status.log_docker("Attempting to proceed with existing image...", "warning")
+        if not verify_docker_image("headless-browser:latest", status):
+            status.log_docker(
+                "No usable Docker image found. Please fix Docker issues before proceeding.",
+                "error"
+            )
+            status.stop()
+            return 1
+        status.stop()
+
+    # Launch interactive mode
+    return interactive_mode()
 
 
 if __name__ == "__main__":

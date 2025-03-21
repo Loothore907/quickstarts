@@ -25,11 +25,12 @@ from anthropic.types.beta import (
 )
 from streamlit.delta_generator import DeltaGenerator
 
-from computer_use_demo.loop import (
+from headless_browser.loop import (
     APIProvider,
+    SYSTEM_PROMPT,
     sampling_loop,
 )
-from computer_use_demo.tools import ToolResult, ToolVersion
+from headless_browser.tools import ToolResult, ToolVersion
 
 PROVIDER_TO_DEFAULT_MODEL_NAME: dict[APIProvider, str] = {
     APIProvider.ANTHROPIC: "claude-3-7-sonnet-20250219",
@@ -195,7 +196,7 @@ async def main():
         st.text_area(
             "Custom System Prompt Suffix",
             key="custom_system_prompt",
-            help="Additional instructions to append to the system prompt. see computer_use_demo/loop.py for the base system prompt.",
+            help="Additional instructions to append to the system prompt. see headless_browser/loop.py for the base system prompt.",
             on_change=lambda: save_to_storage(
                 "system_prompt", st.session_state.custom_system_prompt
             ),

@@ -17,6 +17,9 @@ from datetime import datetime
 from pathlib import Path
 import logging
 from typing import Tuple
+import asyncio
+
+from headless_browser.headless_extractor import HeadlessExtractor
 
 # Configure logging
 logging.basicConfig(
@@ -212,7 +215,7 @@ def create_output_path(domain: str, output_format: str) -> Tuple[Path, str]:
     
     return domain_dir, filename
 
-def create_docker_command(url, instructions, output_file, output_format, api_key=None):
+def create_docker_command(url, instructions, output_path, output_format, api_key=None):
     """Create Docker command for extraction."""
     # Normalize URL
     url = normalize_url(url)
@@ -221,13 +224,18 @@ def create_docker_command(url, instructions, output_file, output_format, api_key
     output_dir = DEFAULT_OUTPUT_DIR
     output_dir.mkdir(exist_ok=True)
     
+    # Extract domain and filename parts from the output_path
+    # output_path might be something like "shared/example_com/20250320_data.json"
+    domain = Path(output_path).parent.name
+    filename = Path(output_path).name
+    
     # Prepare Docker command
     cmd = [
         "docker", "run", "--rm",
         "-e", "HEADLESS_MODE=true",
         "-e", f"EXTRACTION_URL={url}",
         "-e", f"EXTRACTION_INSTRUCTIONS={instructions}",
-        "-e", f"EXTRACTION_OUTPUT=/home/computeruse/shared/{output_file}",
+        "-e", f"EXTRACTION_OUTPUT=/home/computeruse/shared/{domain}/{filename}",
         "-e", f"EXTRACTION_FORMAT={output_format}",
         "-e", f"API_PROVIDER={API_PROVIDER}",
         "-e", f"MODEL={DEFAULT_MODEL}",
@@ -260,7 +268,7 @@ def create_docker_command(url, instructions, output_file, output_format, api_key
         ])
     
     # Add image name
-    cmd.append("computer-use-demo:latest")  # Use our local image
+    cmd.append("headless-browser:latest")  # Use our local image
     
     return cmd
 
@@ -424,35 +432,51 @@ def cli_mode():
     parser = argparse.ArgumentParser(description="Headless Web Extraction Tool")
     parser.add_argument("--url", required=True, help="URL to extract data from")
     parser.add_argument("--instructions", required=True, help="Instructions for extraction")
-    parser.add_argument("--output", help="Output filename (optional, will be auto-generated if not provided)")
     parser.add_argument(
-        "--format", 
-        default=DEFAULT_FORMAT, 
-        choices=["json", "csv", "txt", "png", "jpg", "jpeg"], 
-        help="Output format"
+        "--output",
+        help="Output filename (optional, will be auto-generated if not provided)"
     )
-    parser.add_argument("--api-key", help="Anthropic API key")
+    parser.add_argument(
+        "--type",
+        choices=["data", "screenshot"],
+        default="data",
+        help="Type of extraction (data=JSON, screenshot=PNG)"
+    )
+    parser.add_argument(
+        "--api-key",
+        help="API key (if not set in environment)"
+    )
     
     args = parser.parse_args()
     
-    # Normalize domain and create output path
-    domain = normalize_domain(args.url)
-    
+    # Generate default output path if not provided
     if not args.output:
-        # Generate standardized output path
-        domain_dir, filename = create_output_path(domain, args.format)
-        args.output = str(domain_dir / filename)
+        args.output = get_default_output_path(args.url, args.type)
     
-    # Run the extraction
-    result = run_extraction(args.url, args.instructions, args.output, args.format, args.api_key)
+    # Create extractor
+    extractor = HeadlessExtractor(
+        url=args.url,
+        extraction_instructions=args.instructions,
+        output_file=args.output,
+        is_screenshot=args.type == "screenshot",
+        api_key=args.api_key
+    )
     
-    # Return appropriate exit code
-    if result["status"] == "success":
-        print(f"Extraction completed successfully. Output saved to: {result['output_file']}")
-        return 0
-    else:
-        print(f"Extraction {result['status']}: {result.get('message', 'Unknown error')}")
-        return 1
+    # Run extraction
+    try:
+        asyncio.run(extractor.run())
+    except KeyboardInterrupt:
+        print("\nExtraction cancelled by user")
+        sys.exit(1)
+    except Exception as e:
+        print(f"\nError during extraction: {e}")
+        sys.exit(1)
+
+def get_default_output_path(url: str, extraction_type: str) -> str:
+    """Generate a default output path based on URL and extraction type."""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    extension = "png" if extraction_type == "screenshot" else "json"
+    return f"shared/{timestamp}_{url.replace('://', '_').replace('/', '_')}.{extension}"
 
 if __name__ == "__main__":
     try:

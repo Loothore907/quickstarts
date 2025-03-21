@@ -1,3 +1,13 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "headless_browser"
+version = "0.1.0"
+description = "Headless browser automation with Claude"
+requires-python = ">=3.11"
+
 [tool.pyright]
 venvPath = "."
 venv = ".venv"

@@ -86,23 +86,22 @@ ENV PATH="$HOME/.pyenv/shims:$HOME/.pyenv/bin:$PATH"
 RUN python -m pip install --upgrade pip==23.1.2 setuptools==58.0.4 wheel==0.40.0 && \
     python -m pip config set global.disable-pip-version-check true
 
-# only reinstall if requirements.txt changes
-COPY --chown=$USERNAME:$USERNAME computer_use_demo/requirements.txt $HOME/computer_use_demo/requirements.txt
-RUN python -m pip install -r $HOME/computer_use_demo/requirements.txt
+# Copy requirements first for better caching
+COPY --chown=$USERNAME:$USERNAME headless_browser/requirements.txt $HOME/headless_browser/requirements.txt
+RUN python -m pip install -r $HOME/headless_browser/requirements.txt
 
-# setup desktop env & app
-USER root
-RUN apt-get update && apt-get install -y dos2unix
-USER $USERNAME
-
-# Copy config files first
+# Copy .config files
 COPY --chown=$USERNAME:$USERNAME image/.config/ $HOME/.config/
 
-# Copy other files
+# Copy image files
 COPY --chown=$USERNAME:$USERNAME image/ $HOME/image/
+
+# Fix line endings and make scripts executable
 RUN find $HOME/image -type f -name "*.sh" -exec dos2unix {} \; && \
     chmod +x $HOME/image/*.sh
-COPY --chown=$USERNAME:$USERNAME computer_use_demo/ $HOME/computer_use_demo/
+
+# Copy Python module
+COPY --chown=$USERNAME:$USERNAME headless_browser/ $HOME/headless_browser/
 
 ARG DISPLAY_NUM=1
 ARG HEIGHT=768

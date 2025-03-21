@@ -12,8 +12,10 @@ import sys
 import re
 import time
 import threading
+import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union, Tuple
+from datetime import datetime
 
 from anthropic import (
     Anthropic,
@@ -22,16 +24,17 @@ from anthropic import (
 )
 from anthropic.types.beta import BetaMessageParam, BetaContentBlockParam
 
-from computer_use_demo.loop import (
+from headless_browser.loop import (
     APIProvider,
     SYSTEM_PROMPT,
     sampling_loop,
 )
-from computer_use_demo.tools import (
+from headless_browser.tools import (
     TOOL_GROUPS_BY_VERSION,
     ToolResult,
     ToolVersion,
 )
+from headless_browser.status_updater import StatusUpdater
 
 # Configure logging
 logging.basicConfig(
@@ -44,6 +47,158 @@ logging.basicConfig(
 )
 logger = logging.getLogger("headless_extractor")
 
+# Add Docker-specific logger
+docker_logger = logging.getLogger("docker_operations")
+docker_logger.setLevel(logging.INFO)
+docker_log_path = Path("/home/computeruse/shared/docker_operations.log")
+try:
+    docker_log_path.parent.mkdir(parents=True, exist_ok=True)
+    docker_handler = logging.FileHandler(docker_log_path)
+    docker_handler.setFormatter(logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    ))
+    docker_logger.addHandler(docker_handler)
+except Exception as e:
+    print(f"Warning: Could not set up Docker logging: {e}")
+    
+def log_docker_status(message: str, level: str = "info", error: Exception = None) -> None:
+    """Log Docker operation status to both console and file."""
+    log_func = getattr(docker_logger, level)
+    log_func(message)
+    print(message)
+    
+    if error:
+        docker_logger.error(f"Error details: {str(error)}")
+        docker_logger.error(f"Error type: {type(error).__name__}")
+        if hasattr(error, 'stderr'):
+            docker_logger.error(f"stderr: {error.stderr}")
+
+class DockerStatusUpdater(StatusUpdater):
+    """Docker-specific status updater that inherits from StatusUpdater."""
+    
+    def __init__(self):
+        super().__init__(shared_dir=str(OUTPUT_DIR), domain="docker")
+        self.total_steps = 4  # Docker has 4 main steps: check, cleanup, build, verify
+        
+    def log_docker(self, message: str, level: str = "info", error: Exception = None) -> None:
+        """Log Docker operation status with proper formatting."""
+        if error:
+            self.update_status(
+                f"Docker error: {message}\nError: {str(error)}", 
+                increment_step=False,
+                is_problem=True
+            )
+            if hasattr(error, 'stderr'):
+                self.update_status(f"stderr: {error.stderr}", increment_step=False, is_problem=True)
+        else:
+            self.update_status(message, increment_step=(level == "info"))
+
+def verify_docker_image(image_name: str, status_updater: DockerStatusUpdater) -> bool:
+    """Verify if a Docker image exists."""
+    try:
+        result = subprocess.run(
+            ["docker", "image", "inspect", image_name],
+            capture_output=True,
+            text=True
+        )
+        return result.returncode == 0
+    except Exception as e:
+        status_updater.log_docker(f"Error verifying Docker image {image_name}", "error", e)
+        return False
+
+def cleanup_and_rebuild_docker() -> bool:
+    """Clean up old Docker images and rebuild the current one."""
+    status = DockerStatusUpdater()
+    status.start()
+    start_time = datetime.now()
+    
+    try:
+        status.log_docker(f"\n=== Starting Docker cleanup and rebuild at {start_time} ===")
+        
+        # Check Docker daemon
+        status.log_docker("Checking Docker daemon status...")
+        daemon_check = subprocess.run(["docker", "info"], capture_output=True, text=True)
+        if daemon_check.returncode != 0:
+            status.log_docker("Docker daemon is not running or not accessible", "error")
+            return False
+        status.log_docker("Docker daemon is running")
+        
+        # List existing images before cleanup
+        status.log_docker("Current Docker images:")
+        subprocess.run(["docker", "images"], capture_output=False)
+        
+        # Remove old images
+        status.log_docker("Removing old Docker images...")
+        for image in ["headless-browser:latest", "computer-use-demo:latest"]:
+            if verify_docker_image(image, status):
+                try:
+                    subprocess.run(
+                        ["docker", "image", "rm", image],
+                        capture_output=True,
+                        check=True,
+                        text=True
+                    )
+                    status.log_docker(f"Successfully removed {image}")
+                except subprocess.CalledProcessError as e:
+                    status.log_docker(f"Warning: Failed to remove {image}", "warning", e)
+            else:
+                status.log_docker(f"Image {image} not found, skipping removal")
+        
+        # Build new image
+        status.log_docker("Building new Docker image...")
+        build_start = time.time()
+        
+        build_process = subprocess.Popen(
+            ["docker", "build", "-t", "headless-browser", "."],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+            universal_newlines=True
+        )
+        
+        # Stream build output
+        while True:
+            output = build_process.stdout.readline()
+            if output == '' and build_process.poll() is not None:
+                break
+            if output:
+                status.log_docker(output.strip(), increment_step=False)
+                
+        # Get any remaining output
+        stdout, stderr = build_process.communicate()
+        if stdout:
+            status.log_docker(stdout.strip(), increment_step=False)
+        
+        if build_process.returncode != 0:
+            if stderr:
+                status.log_docker("Error building Docker image", "error", 
+                                type('BuildError', (), {'stderr': stderr})())
+            return False
+        
+        build_time = time.time() - build_start
+        status.log_docker(f"Build completed in {build_time:.1f} seconds")
+        
+        # Verify new image
+        status.log_docker("Verifying new image...")
+        if not verify_docker_image("headless-browser:latest", status):
+            status.log_docker("Failed to verify new image", "error")
+            return False
+        
+        # Get image details
+        status.log_docker("New image details:")
+        subprocess.run(["docker", "image", "inspect", "headless-browser:latest"], capture_output=False)
+        
+        total_time = datetime.now() - start_time
+        status.log_docker(f"=== Docker cleanup and rebuild completed successfully in {total_time} ===")
+        return True
+        
+    except Exception as e:
+        status.log_docker("Unexpected error during Docker operations", "error", e)
+        return False
+    finally:
+        status.stop()
+
 # Output directory for extracted data
 OUTPUT_DIR = Path("/home/computeruse/shared")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -51,8 +206,8 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 class StatusUpdater:
     """Updates status file in shared directory to provide feedback."""
     
-    def __init__(self):
-        self.status_file = Path("/home/computeruse/shared/container_status.txt")
+    def __init__(self, shared_dir: str, domain: str):
+        self.status_file = Path(f"{shared_dir}/{domain}/container_status.txt")
         self.running = False
         self.current_status = "Initializing extraction process..."
         self.lock = threading.Lock()
@@ -71,13 +226,13 @@ class StatusUpdater:
         if hasattr(self, 'thread') and self.thread.is_alive():
             self.thread.join(timeout=1.0)
             
-    def update_status(self, status, increment_step=True):
+    def update_status(self, status: str, increment_step: bool = True, is_problem: bool = False):
         """Update the current status."""
         with self.lock:
-            self.current_status = status
+            self.current_status = f"I HAVE A PROBLEM: {status}" if is_problem else status
             if increment_step:
                 self.steps_completed += 1
-            self._write_status(status)
+            self._write_status(self.current_status)
             
     def _update_loop(self):
         """Main update loop that writes status to file regularly."""
@@ -125,7 +280,7 @@ class HeadlessExtractor:
         url: str,
         extraction_instructions: str,
         output_file: str,
-        output_format: str = "json",
+        is_screenshot: bool = False,  # New parameter to determine extraction type
         api_provider: str = "anthropic",
         api_key: Optional[str] = None,
         tool_version: ToolVersion = "computer_use_20250124",
@@ -138,7 +293,7 @@ class HeadlessExtractor:
             url: The URL to extract data from
             extraction_instructions: Instructions for Claude on what data to extract
             output_file: Path to save the extracted data
-            output_format: Format of the output data (json, csv, txt)
+            is_screenshot: If True, this is a screenshot extraction (PNG), otherwise it's data extraction (JSON)
             api_provider: API provider to use (anthropic, bedrock, vertex)
             api_key: API key for the provider
             tool_version: Version of the tools to use
@@ -146,18 +301,30 @@ class HeadlessExtractor:
         """
         self.url = url
         self.extraction_instructions = extraction_instructions
-        self.output_file = Path(output_file)
-        self.output_format = output_format
+        self.is_screenshot = is_screenshot
+        self.output_format = "png" if is_screenshot else "json"
+        
+        # Ensure correct file extension
+        output_path = Path(output_file)
+        self.output_file = output_path.with_suffix(f".{self.output_format}")
+        
         self.api_provider = APIProvider(api_provider)
         self.api_key = api_key or os.environ.get("ANTHROPIC_API_KEY", "")
         self.tool_version = tool_version
         self.model = model
         
-        # Ensure output directory exists
-        self.output_file.parent.mkdir(parents=True, exist_ok=True)
+        # Extract domain from output_file path for logging
+        self.domain = Path(output_file).parent.name
+        if not self.domain or self.domain == "shared":
+            self.domain = normalize_domain(url)  # Fallback to extracting from URL
         
-        # Extract domain for logging
-        self.domain = normalize_domain(url)
+        # Ensure domain directory exists in the output path
+        output_parent = self.output_file.parent
+        if output_parent.name != self.domain:
+            # Create proper domain subdirectory if not already in path
+            domain_dir = output_parent / self.domain
+            domain_dir.mkdir(parents=True, exist_ok=True)
+            self.output_file = domain_dir / self.output_file.name
         
         # Messages for the conversation
         self.messages: List[BetaMessageParam] = []
@@ -168,39 +335,38 @@ class HeadlessExtractor:
         # Tool outputs captured during execution
         self.tool_outputs: Dict[str, ToolResult] = {}
         
-        # Status updater
-        self.status_updater = StatusUpdater()
+        # Status updater with domain
+        self.status_updater = StatusUpdater(shared_dir=str(OUTPUT_DIR), domain=self.domain)
         
         # Custom system prompt for extraction
         self.system_prompt_suffix = self._generate_system_prompt_suffix()
 
     def _generate_system_prompt_suffix(self) -> str:
         """Generate a specialized system prompt suffix for headless extraction."""
-        is_image_format = self.output_format.lower() in ['png', 'jpg', 'jpeg']
-        
         base_prompt = f"""
 <EXTRACTION_TASK>
-You are operating in headless mode to extract data from a website without human intervention.
+You are operating in headless mode to extract {"screenshots" if self.is_screenshot else "data"} from a website without human intervention.
 Target URL: {self.url}
 Extraction Instructions: {self.extraction_instructions}
-Output Format: {self.output_format}
+Output Type: {"Screenshot capture" if self.is_screenshot else "Data extraction"}
+Output Format: {"PNG image" if self.is_screenshot else "JSON data"}
 Output Directory: {self.output_file.parent}
 
 Please follow these steps:
 1. Navigate to the provided URL
-2. {"Take a screenshot of the specified content" if is_image_format else "Identify and extract the requested information"}
-3. {"Save the screenshot in " + self.output_format + " format" if is_image_format else "Format the data as " + self.output_format}
-4. Save the {"image" if is_image_format else "extracted data"} to the specified output file: {self.output_file}
+2. {"Take a screenshot of the specified content" if self.is_screenshot else "Identify and extract the requested information"}
+3. {"Save the screenshot in PNG format" if self.is_screenshot else "Format the data as JSON"}
+4. Save the {"screenshot" if self.is_screenshot else "data"} to the specified output file: {self.output_file}
 
 When you're finished, explicitly state that extraction is complete and summarize what was saved.
 </EXTRACTION_TASK>
 
 <IMPORTANT>
 - You are operating without human oversight, so be thorough and careful
-- {"Focus on capturing the right visual content in the screenshot" if is_image_format else "Take screenshots at key points during the extraction process"}
+- {"Focus on capturing the right visual content in the screenshot" if self.is_screenshot else "Ensure all required data is collected accurately"}
 - If you encounter any obstacles, try alternative approaches before giving up
-- {"Ensure the screenshot is saved in the correct format" if is_image_format else "Format the final data properly according to the requested output format"}
-- Save the {"screenshot" if is_image_format else "data"} to the exact output file specified: {self.output_file}
+- {"Ensure the screenshot is saved as a PNG file" if self.is_screenshot else "Format the JSON data properly with correct structure"}
+- Save the output to exactly: {self.output_file}
 </IMPORTANT>
 """
         return base_prompt
@@ -407,6 +573,41 @@ When you're finished, explicitly state that extraction is complete and summarize
 
 async def main(args: argparse.Namespace) -> None:
     """Main entry point for headless extraction."""
+    
+    # Prompt for Docker cleanup and rebuild
+    try:
+        response = input("\nDo you want to clean and rebuild your docker image? [Y/n] ").lower()
+        if response in ['', 'y', 'yes']:
+            if not cleanup_and_rebuild_docker():
+                status = DockerStatusUpdater()
+                status.start()
+                status.log_docker(
+                    "Failed to rebuild Docker image. Attempting to proceed with existing image...",
+                    "warning"
+                )
+                # Verify we have a usable image
+                if not verify_docker_image("headless-browser:latest", status):
+                    status.log_docker(
+                        "No usable Docker image found. Please fix Docker issues before proceeding.",
+                        "error"
+                    )
+                    status.stop()
+                    return
+                status.stop()
+    except Exception as e:
+        status = DockerStatusUpdater()
+        status.start()
+        status.log_docker("Error during Docker cleanup prompt", "error", e)
+        status.log_docker("Attempting to proceed with existing image...", "warning")
+        if not verify_docker_image("headless-browser:latest", status):
+            status.log_docker(
+                "No usable Docker image found. Please fix Docker issues before proceeding.",
+                "error"
+            )
+            status.stop()
+            return
+        status.stop()
+    
     # Early debug logging
     try:
         debug_log_path = Path("/home/computeruse/shared/debug_log.txt")
@@ -430,7 +631,7 @@ async def main(args: argparse.Namespace) -> None:
         url=args.url,
         extraction_instructions=args.instructions,
         output_file=args.output,
-        output_format=args.format,
+        is_screenshot=args.type == "screenshot",
         api_provider=args.provider,
         api_key=args.api_key,
         tool_version=args.tool_version,
@@ -470,12 +671,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Headless web content extractor")
     parser.add_argument("--url", required=True, help="URL to extract data from")
     parser.add_argument("--instructions", required=True, help="Instructions for extraction")
-    parser.add_argument("--output", required=True, help="Output file path")
+    parser.add_argument("--output", required=True, help="Output file path (extension will be added automatically)")
     parser.add_argument(
-        "--format", 
-        default="json", 
-        choices=["json", "csv", "txt", "png", "jpg", "jpeg"],
-        help="Output format"
+        "--type",
+        choices=["data", "screenshot"],
+        default="data",
+        help="Type of extraction (data=JSON, screenshot=PNG)"
     )
     parser.add_argument("--provider", default="anthropic", choices=["anthropic", "bedrock", "vertex"], help="API provider")
     parser.add_argument("--api-key", help="API key (if not set in environment)")

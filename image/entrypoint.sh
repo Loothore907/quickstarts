@@ -34,12 +34,12 @@ if [ "$HEADLESS_MODE" = "true" ]; then
     /home/computeruse/image/novnc_startup.sh
     
     # Run headless extractor
-    python -m computer_use_demo.headless_extractor \
+    python -m headless_browser.headless_extractor \
         --url "$EXTRACTION_URL" \
         --instructions "$EXTRACTION_INSTRUCTIONS" \
         --output "$EXTRACTION_OUTPUT" \
         --format "$EXTRACTION_FORMAT" \
-        --provider "${API_PROVIDER:-anthropic}" \
+        --api-provider "${API_PROVIDER:-anthropic}" \
         --model "${MODEL:-claude-3-7-sonnet-20250219}" \
         --tool-version "${TOOL_VERSION:-computer_use_20250124}"
     
@@ -56,7 +56,7 @@ else
     python http_server.py > /tmp/server_logs.txt 2>&1 &
 
     # Start Streamlit
-    STREAMLIT_SERVER_PORT=8501 python -m streamlit run computer_use_demo/streamlit.py > /tmp/streamlit_stdout.log &
+    STREAMLIT_SERVER_PORT=8501 python -m streamlit run headless_browser/streamlit.py > /tmp/streamlit_stdout.log &
 
     echo "✨ Computer Use Demo is ready!"
     echo "➡️  Open http://localhost:8080 in your browser to begin"

@@ -8,17 +8,17 @@ This guide explains how to set up and use the Computer Use Demo in headless mode
 
 Add this new file to your project:
 
-| File | Path | Purpose |
-|------|------|---------|
-| `status_updater.py` | `computer_use_demo/status_updater.py` | Helper utility for status updates |
+| File | Location | Description |
+|------|----------|-------------|
+| `status_updater.py` | `headless_browser/status_updater.py` | Helper utility for status updates |
 
 ### 2. Modify Existing Files
 
 Update these existing files with the improved functionality:
 
-| File | Path | Purpose |
-|------|------|---------|
-| `headless_extractor.py` | `computer_use_demo/headless_extractor.py` | Core extraction module with status updates |
+| File | Location | Description |
+|------|----------|-------------|
+| `headless_extractor.py` | `headless_browser/headless_extractor.py` | Core extraction module with status updates |
 | `extraction_cli.py` | Project root directory | CLI with progress feedback |
 | `entrypoint.sh` | `image/entrypoint.sh` | Container entry point with headless support |
 
