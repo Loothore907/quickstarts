@@ -3,7 +3,7 @@
 set -e
 
 export DISPLAY=:${DISPLAY_NUM}
-./xvfb_startup.sh
-./tint2_startup.sh
-./mutter_startup.sh
-./x11vnc_startup.sh
+/home/computeruse/image/xvfb_startup.sh
+/home/computeruse/image/tint2_startup.sh
+/home/computeruse/image/mutter_startup.sh
+/home/computeruse/image/x11vnc_startup.sh

@@ -91,7 +91,17 @@ COPY --chown=$USERNAME:$USERNAME computer_use_demo/requirements.txt $HOME/comput
 RUN python -m pip install -r $HOME/computer_use_demo/requirements.txt
 
 # setup desktop env & app
-COPY --chown=$USERNAME:$USERNAME image/ $HOME
+USER root
+RUN apt-get update && apt-get install -y dos2unix
+USER $USERNAME
+
+# Copy config files first
+COPY --chown=$USERNAME:$USERNAME image/.config/ $HOME/.config/
+
+# Copy other files
+COPY --chown=$USERNAME:$USERNAME image/ $HOME/image/
+RUN find $HOME/image -type f -name "*.sh" -exec dos2unix {} \; && \
+    chmod +x $HOME/image/*.sh
 COPY --chown=$USERNAME:$USERNAME computer_use_demo/ $HOME/computer_use_demo/
 
 ARG DISPLAY_NUM=1
@@ -101,4 +111,4 @@ ENV DISPLAY_NUM=$DISPLAY_NUM
 ENV HEIGHT=$HEIGHT
 ENV WIDTH=$WIDTH
 
-ENTRYPOINT [ "./entrypoint.sh" ]
+ENTRYPOINT [ "/home/computeruse/image/entrypoint.sh" ]

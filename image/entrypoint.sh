@@ -5,7 +5,7 @@ set -e
 HEADLESS_MODE=${HEADLESS_MODE:-false}
 
 # Always start the X server and virtual desktop
-./start_all.sh
+/home/computeruse/image/start_all.sh
 
 if [ "$HEADLESS_MODE" = "true" ]; then
     echo "Starting in headless mode..."
@@ -31,7 +31,7 @@ if [ "$HEADLESS_MODE" = "true" ]; then
     echo "Output Format: $EXTRACTION_FORMAT"
     
     # Start the NoVNC server for debug purposes
-    ./novnc_startup.sh
+    /home/computeruse/image/novnc_startup.sh
     
     # Run headless extractor
     python -m computer_use_demo.headless_extractor \
@@ -50,7 +50,7 @@ else
     echo "Starting in interactive mode..."
     
     # Start the NoVNC server
-    ./novnc_startup.sh
+    /home/computeruse/image/novnc_startup.sh
 
     # Start the HTTP server for the combined interface
     python http_server.py > /tmp/server_logs.txt 2>&1 &

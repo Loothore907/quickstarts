@@ -7,7 +7,7 @@ import os
 import time
 import threading
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 class StatusUpdater:
     """
@@ -31,6 +31,7 @@ class StatusUpdater:
         self.steps_completed = 0
         self.total_steps = 5  # Approximate number of steps in extraction
         self.start_time = time.time()
+        self.has_problem = False
         
     def start(self):
         """
@@ -42,6 +43,9 @@ class StatusUpdater:
         self.thread = threading.Thread(target=self._update_loop, daemon=True)
         self.thread.start()
         
+        # Write initial status immediately
+        self._write_status("Container started successfully - beginning extraction setup")
+        
     def stop(self):
         """
         Stop the status updater thread.
@@ -51,20 +55,37 @@ class StatusUpdater:
         if hasattr(self, 'thread') and self.thread.is_alive():
             self.thread.join(timeout=1.0)
             
-    def update_status(self, status: str, increment_step: bool = True):
+    def update_status(self, status: str, increment_step: bool = True, is_problem: bool = False):
         """
         Update the current status.
         
         Args:
             status: New status message
             increment_step: Whether to increment the step counter
+            is_problem: Whether this status represents a problem
         """
         with self.lock:
-            self.current_status = status
+            # Format message with appropriate prefix
+            if is_problem:
+                self.has_problem = True
+                formatted_status = f"I HAVE A PROBLEM: {status}"
+            else:
+                formatted_status = f"SUCCESSFULLY COMPLETED: {status}" if increment_step else f"PROGRESS UPDATE: {status}"
+            
+            self.current_status = formatted_status
             if increment_step:
                 self.steps_completed += 1
-            self._write_status(status)
+            self._write_status(formatted_status)
             
+    def has_error(self) -> bool:
+        """
+        Check if the current status indicates an error.
+        
+        Returns:
+            True if there is an error, False otherwise
+        """
+        return self.has_problem
+    
     def get_elapsed_time(self) -> float:
         """
         Get elapsed time in seconds since the updater was started.

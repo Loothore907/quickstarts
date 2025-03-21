@@ -13,7 +13,7 @@ import re
 import time
 import threading
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union, Tuple
 
 from anthropic import (
     Anthropic,
@@ -104,6 +104,17 @@ class StatusUpdater:
             print(f"Error writing status: {e}")
 
 
+def normalize_domain(url: str) -> str:
+    """Normalize domain name by removing protocol and www, replacing dots with underscores."""
+    # Remove protocol if present
+    domain = re.sub(r'^https?://', '', url)
+    # Remove www. if present
+    domain = re.sub(r'^www\.', '', domain)
+    # Get the domain part (before any path)
+    domain = domain.split('/')[0]
+    # Replace dots with underscores for directory name
+    return domain.replace('.', '_')
+
 class HeadlessExtractor:
     """
     Headless extractor that uses Claude to extract data from websites without UI.
@@ -142,6 +153,12 @@ class HeadlessExtractor:
         self.tool_version = tool_version
         self.model = model
         
+        # Ensure output directory exists
+        self.output_file.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Extract domain for logging
+        self.domain = normalize_domain(url)
+        
         # Messages for the conversation
         self.messages: List[BetaMessageParam] = []
         
@@ -159,30 +176,34 @@ class HeadlessExtractor:
 
     def _generate_system_prompt_suffix(self) -> str:
         """Generate a specialized system prompt suffix for headless extraction."""
-        return f"""
+        is_image_format = self.output_format.lower() in ['png', 'jpg', 'jpeg']
+        
+        base_prompt = f"""
 <EXTRACTION_TASK>
 You are operating in headless mode to extract data from a website without human intervention.
 Target URL: {self.url}
 Extraction Instructions: {self.extraction_instructions}
 Output Format: {self.output_format}
+Output Directory: {self.output_file.parent}
 
 Please follow these steps:
 1. Navigate to the provided URL
-2. Identify and extract the requested information
-3. Format the data as {self.output_format}
-4. Save the extracted data to the shared directory
+2. {"Take a screenshot of the specified content" if is_image_format else "Identify and extract the requested information"}
+3. {"Save the screenshot in " + self.output_format + " format" if is_image_format else "Format the data as " + self.output_format}
+4. Save the {"image" if is_image_format else "extracted data"} to the specified output file: {self.output_file}
 
 When you're finished, explicitly state that extraction is complete and summarize what was saved.
 </EXTRACTION_TASK>
 
 <IMPORTANT>
 - You are operating without human oversight, so be thorough and careful
-- Take screenshots at key points during the extraction process
+- {"Focus on capturing the right visual content in the screenshot" if is_image_format else "Take screenshots at key points during the extraction process"}
 - If you encounter any obstacles, try alternative approaches before giving up
-- Format the final data properly according to the requested output format
-- Save the data to a file in /home/computeruse/shared/ with a descriptive filename
+- {"Ensure the screenshot is saved in the correct format" if is_image_format else "Format the final data properly according to the requested output format"}
+- Save the {"screenshot" if is_image_format else "data"} to the exact output file specified: {self.output_file}
 </IMPORTANT>
 """
+        return base_prompt
 
     async def _output_callback(self, content_block: BetaContentBlockParam) -> None:
         """Callback for capturing Claude's outputs."""
@@ -190,18 +211,30 @@ When you're finished, explicitly state that extraction is complete and summarize
             text = content_block.get("text", "")
             logger.info(f"CLAUDE: {text[:100]}...")
             
+            # Log that Claude has received instructions if this is the first message
+            if not hasattr(self, '_first_message_received'):
+                self.status_updater.update_status("Claude has received extraction instructions")
+                self._first_message_received = True
+            
             # Update status based on Claude's output
             lower_text = text.lower()
             if "navigating to" in lower_text or "opening" in lower_text:
-                self.status_updater.update_status("Navigating to website...")
+                self.status_updater.update_status("Claude is navigating to the target website")
             elif "extracting" in lower_text or "gathering" in lower_text:
-                self.status_updater.update_status("Extracting data from website...")
+                self.status_updater.update_status("Claude is extracting data from the website")
             elif "formatting" in lower_text or "organizing" in lower_text:
-                self.status_updater.update_status("Formatting extracted data...")
+                self.status_updater.update_status("Claude is formatting the extracted data")
             elif "saving" in lower_text or "writing" in lower_text:
-                self.status_updater.update_status("Saving data to file...")
+                self.status_updater.update_status("Claude is saving data to file")
             elif "completed" in lower_text or "finished" in lower_text:
-                self.status_updater.update_status("Extraction completed successfully!")
+                self.status_updater.update_status("Claude has completed the extraction task")
+            elif "error" in lower_text or "cannot" in lower_text or "failed" in lower_text or "unable" in lower_text:
+                # Detect potential problems in Claude's responses
+                self.status_updater.update_status(
+                    f"Claude encountered an issue: {text[:100]}...", 
+                    increment_step=False, 
+                    is_problem=True
+                )
                 
         elif isinstance(content_block, dict) and content_block.get("type") == "tool_use":
             tool_name = content_block.get("name", "")
@@ -210,11 +243,11 @@ When you're finished, explicitly state that extraction is complete and summarize
             
             # Update status based on tool use
             if tool_name == "computer" and action == "screenshot":
-                self.status_updater.update_status("Taking screenshot of current page...", increment_step=False)
+                self.status_updater.update_status("Claude is taking screenshots for navigation", increment_step=False)
             elif tool_name == "bash":
-                self.status_updater.update_status("Executing command in bash...", increment_step=False)
+                self.status_updater.update_status("Claude is executing commands to process data", increment_step=False)
             elif tool_name == "str_replace_editor":
-                self.status_updater.update_status("Editing or saving file...", increment_step=False)
+                self.status_updater.update_status("Claude is saving extracted data to file", increment_step=False)
 
     def _tool_output_callback(self, result: ToolResult, tool_id: str) -> None:
         """Callback for capturing tool outputs."""
@@ -229,9 +262,16 @@ When you're finished, explicitly state that extraction is complete and summarize
         """Callback for API responses."""
         if error:
             logger.error(f"API ERROR: {error}")
-            self.status_updater.update_status(f"API error: {str(error)[:50]}...", increment_step=False)
+            self.status_updater.update_status(
+                f"API connection error: {str(error)[:100]}...", 
+                increment_step=False,
+                is_problem=True
+            )
         else:
             logger.info("API request successful")
+            if not hasattr(self, '_api_connected'):
+                self.status_updater.update_status("Successfully connected to Claude API")
+                self._api_connected = True
 
     async def run(self) -> Dict[str, Any]:
         """Run the headless extraction process."""
@@ -239,8 +279,56 @@ When you're finished, explicitly state that extraction is complete and summarize
         self.status_updater.start()
         
         try:
+            # Ensure debug directory exists and add more verbose logging
+            debug_log_path = Path("/home/computeruse/shared/debug_log.txt")
+            try:
+                debug_log_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(debug_log_path, "w") as f:
+                    f.write(f"=== Extraction Debug Log ===\n")
+                    f.write(f"Started at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                    f.write(f"URL: {self.url}\n")
+                    f.write(f"API Provider: {self.api_provider}\n")
+                    f.write(f"Output Format: {self.output_format}\n")
+                    f.write(f"Output File: {self.output_file}\n")
+                    f.write(f"Model: {self.model}\n")
+                    f.write(f"Tool Version: {self.tool_version}\n")
+                    f.write(f"Shared Directory: {OUTPUT_DIR}\n")
+                    f.write(f"Shared Directory exists: {OUTPUT_DIR.exists()}\n")
+                    f.write(f"Shared Directory is writable: {os.access(OUTPUT_DIR, os.W_OK)}\n")
+                logger.info(f"Created debug log at {debug_log_path}")
+            except Exception as e:
+                logger.error(f"Failed to create debug log: {e}")
+                self.status_updater.update_status(
+                    f"Failed to create debug log: {str(e)}", 
+                    increment_step=False,
+                    is_problem=True
+                )
+            
+            # Add explicit API key check
+            if not self.api_key:
+                error_msg = "ERROR: No API key provided"
+                logger.error(error_msg)
+                try:
+                    with open(debug_log_path, "a") as f:
+                        f.write(f"\n{error_msg}\n")
+                except Exception as e:
+                    logger.error(f"Failed to append to debug log: {e}")
+                self.status_updater.update_status("Missing API key", is_problem=True)
+                raise ValueError("API key is required but not provided")
+            
+            # Log successful API key check
+            try:
+                with open(debug_log_path, "a") as f:
+                    f.write("\nAPI key validation successful\n")
+            except Exception as e:
+                logger.error(f"Failed to append to debug log: {e}")
+            
             # Initialize messages with the extraction task
-            self.status_updater.update_status("Preparing extraction task...")
+            self.status_updater.update_status("Building Docker container for headless extraction")
+            time.sleep(2)  # Give time for status to be seen
+            self.status_updater.update_status("Docker container built successfully")
+            
+            self.status_updater.update_status("Preparing extraction task for Claude")
             self.messages = [
                 {
                     "role": "user",
@@ -249,7 +337,7 @@ When you're finished, explicitly state that extraction is complete and summarize
             ]
             
             # Run the sampling loop
-            self.status_updater.update_status("Starting Claude extraction process...")
+            self.status_updater.update_status("Starting Claude extraction process")
             self.messages = await sampling_loop(
                 model=self.model,
                 provider=self.api_provider,
@@ -265,11 +353,11 @@ When you're finished, explicitly state that extraction is complete and summarize
                 only_n_most_recent_images=3,
             )
             
-            self.status_updater.update_status("Extraction process completed!")
+            self.status_updater.update_status("Extraction process completed")
             logger.info("Extraction process completed")
             
             # Look for results in the final messages
-            self.status_updater.update_status("Analyzing extraction results...")
+            self.status_updater.update_status("Analyzing extraction results")
             self._parse_extraction_results()
             
             return self.extraction_results
@@ -277,7 +365,11 @@ When you're finished, explicitly state that extraction is complete and summarize
         except Exception as e:
             error_msg = f"Error during extraction: {e}"
             logger.error(error_msg)
-            self.status_updater.update_status(f"Error: {error_msg}")
+            self.status_updater.update_status(
+                error_msg, 
+                increment_step=False,
+                is_problem=True
+            )
             raise
         finally:
             self.status_updater.stop()
@@ -315,6 +407,24 @@ When you're finished, explicitly state that extraction is complete and summarize
 
 async def main(args: argparse.Namespace) -> None:
     """Main entry point for headless extraction."""
+    # Early debug logging
+    try:
+        debug_log_path = Path("/home/computeruse/shared/debug_log.txt")
+        debug_log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(debug_log_path, "w") as f:
+            f.write("=== Early Debug Log ===\n")
+            f.write(f"Process started at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Arguments received:\n")
+            f.write(f"  URL: {args.url}\n")
+            f.write(f"  Output: {args.output}\n")
+            f.write(f"  Format: {args.format}\n")
+            f.write(f"  Provider: {args.provider}\n")
+            f.write(f"Working directory: {os.getcwd()}\n")
+            f.write(f"Running in Docker: True\n")  # Add this to confirm we're in Docker
+    except Exception as e:
+        print(f"Failed to create early debug log: {e}")
+        logger.error(f"Failed to create early debug log: {e}")
+    
     # Create extractor instance
     extractor = HeadlessExtractor(
         url=args.url,
@@ -357,11 +467,16 @@ async def main(args: argparse.Namespace) -> None:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Headless web data extractor using Claude")
+    parser = argparse.ArgumentParser(description="Headless web content extractor")
     parser.add_argument("--url", required=True, help="URL to extract data from")
-    parser.add_argument("--instructions", required=True, help="Extraction instructions for Claude")
+    parser.add_argument("--instructions", required=True, help="Instructions for extraction")
     parser.add_argument("--output", required=True, help="Output file path")
-    parser.add_argument("--format", default="json", choices=["json", "csv", "txt"], help="Output format")
+    parser.add_argument(
+        "--format", 
+        default="json", 
+        choices=["json", "csv", "txt", "png", "jpg", "jpeg"],
+        help="Output format"
+    )
     parser.add_argument("--provider", default="anthropic", choices=["anthropic", "bedrock", "vertex"], help="API provider")
     parser.add_argument("--api-key", help="API key (if not set in environment)")
     parser.add_argument("--tool-version", default="computer_use_20250124", help="Tool version")
