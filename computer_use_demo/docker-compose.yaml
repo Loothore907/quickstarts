@@ -1,0 +1,48 @@
+version: '3'
+
+services:
+  # Interactive mode
+  interactive:
+    image: ghcr.io/anthropics/anthropic-quickstarts:computer-use-demo-latest
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - API_PROVIDER=${API_PROVIDER:-anthropic}
+      - MODEL=${MODEL:-claude-3-7-sonnet-20250219}
+      - HEADLESS_MODE=false
+      # Optional screen dimensions
+      - WIDTH=${WIDTH:-1024}
+      - HEIGHT=${HEIGHT:-768}
+    ports:
+      - "5900:5900"   # VNC
+      - "6080:6080"   # noVNC
+      - "8080:8080"   # Combined interface
+      - "8501:8501"   # Streamlit
+    volumes:
+      - ${HOME}/.anthropic:/home/computeruse/.anthropic
+      - ./shared:/home/computeruse/shared
+    stdin_open: true
+    tty: true
+
+  # Headless extraction mode
+  headless:
+    image: ghcr.io/anthropics/anthropic-quickstarts:computer-use-demo-latest
+    environment:
+      - HEADLESS_MODE=true
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - API_PROVIDER=${API_PROVIDER:-anthropic}
+      - MODEL=${MODEL:-claude-3-7-sonnet-20250219}
+      - TOOL_VERSION=${TOOL_VERSION:-computer_use_20250124}
+      - EXTRACTION_URL=${EXTRACTION_URL}
+      - EXTRACTION_INSTRUCTIONS=${EXTRACTION_INSTRUCTIONS}
+      - EXTRACTION_OUTPUT=${EXTRACTION_OUTPUT:-/home/computeruse/shared/extraction_results.json}
+      - EXTRACTION_FORMAT=${EXTRACTION_FORMAT:-json}
+      # Use smaller dimensions for headless mode
+      - WIDTH=${WIDTH:-800}
+      - HEIGHT=${HEIGHT:-600}
+    ports:
+      - "6080:6080"   # noVNC (for debugging)
+    volumes:
+      - ${HOME}/.anthropic:/home/computeruse/.anthropic
+      - ./shared:/home/computeruse/shared
+    # Make sure the container exits when the extraction is complete
+    init: true
