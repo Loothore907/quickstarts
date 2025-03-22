@@ -89,7 +89,7 @@ async def sampling_loop(
     Agentic sampling loop for the assistant/tool interaction of computer use.
     """
     tool_group = TOOL_GROUPS_BY_VERSION[tool_version]
-    tool_collection = ToolCollection(*(ToolCls() for ToolCls in tool_group.tools))
+    tool_collection = ToolCollection(*(ToolCls() for ToolCls in tool_group["tools"]))
     system = BetaTextBlockParam(
         type="text",
         text=f"{SYSTEM_PROMPT}{' ' + system_prompt_suffix if system_prompt_suffix else ''}",
@@ -97,7 +97,7 @@ async def sampling_loop(
 
     while True:
         enable_prompt_caching = False
-        betas = [tool_group.beta_flag] if tool_group.beta_flag else []
+        betas = [tool_group["beta_flag"]] if tool_group["beta_flag"] else []
         if token_efficient_tools_beta:
             betas.append("token-efficient-tools-2025-02-19")
         image_truncation_threshold = only_n_most_recent_images or 0
@@ -320,5 +320,5 @@ def _make_api_tool_result(
 
 def _maybe_prepend_system_tool_result(result: ToolResult, result_text: str):
     if result.system:
-        result_text = f"<system>{result.system}</system>\n{result_text}"
+        result_text = f"<s>{result.system}</s>\n{result_text}"
     return result_text
