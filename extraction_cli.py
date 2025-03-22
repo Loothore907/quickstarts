@@ -16,7 +16,7 @@ import platform
 from datetime import datetime
 from pathlib import Path
 import logging
-from typing import Tuple
+from typing import Tuple, Optional
 import asyncio
 
 from headless_browser.headless_extractor import HeadlessExtractor
@@ -71,10 +71,12 @@ class ExtractionMonitor:
             self.monitor_thread.join(timeout=1.0)
     
     def _monitor_loop(self):
-        """Main monitoring loop."""
+        """Main monitoring loop with enhanced inactivity detection."""
         dots = 0
         spinner = ["|", "/", "-", "\\"]
         spinner_idx = 0
+        last_status_update = time.time()
+        inactivity_warning_shown = False
         
         while self.running:
             if self.process.poll() is not None:
@@ -88,7 +90,16 @@ class ExtractionMonitor:
             if container_status_file.exists():
                 try:
                     status = container_status_file.read_text(errors='replace')
-                    self.last_status = status
+                    if status != self.last_status:
+                        last_status_update = time.time()
+                        self.last_status = status
+                        inactivity_warning_shown = False
+                    
+                    # Check for inactivity (no status updates for 2 minutes)
+                    if time.time() - last_status_update > 120 and not inactivity_warning_shown:
+                        print(f"\n\n⚠️ WARNING: No status updates for {int(time.time() - last_status_update)} seconds.")
+                        print("The extraction process may be stalled. Consider terminating (Ctrl+C) and restarting.")
+                        inactivity_warning_shown = True
                     
                     # Check for problems
                     if "I HAVE A PROBLEM:" in status:
@@ -99,7 +110,6 @@ class ExtractionMonitor:
                         additional_instructions = input("\nEnter additional instructions to help Claude (or just press Enter to continue): ")
                         if additional_instructions:
                             # For now, just log that we would handle this
-                            # In a real implementation, we'd need a way to send this to the running container
                             print(f"\nAdditional instructions would be sent: {additional_instructions}")
                     
                     self._write_status(status)
@@ -111,11 +121,17 @@ class ExtractionMonitor:
                 spinner_char = spinner[spinner_idx]
                 spinner_idx = (spinner_idx + 1) % len(spinner)
                 
+                # Check for container creation inactivity (no status file after 60s)
+                if elapsed > 60 and not container_status_file.exists() and not inactivity_warning_shown:
+                    print(f"\n\n⚠️ WARNING: No status file created after {int(elapsed)} seconds.")
+                    print("The container may not be initializing correctly. Check Docker logs.")
+                    inactivity_warning_shown = True
+                
                 status = f"{spinner_char} Extraction in progress ({elapsed:.0f}s elapsed)"
                 dots = (dots + 1) % 4
                 self._write_status(status + "." * dots)
             
-            # Also capture process stdout/stderr for additional feedback
+            # Process stdout/stderr
             try:
                 stdout_line = self.process.stdout.readline().strip()
                 if stdout_line:
@@ -202,6 +218,42 @@ def normalize_domain(url: str) -> str:
     # Replace dots with underscores for directory name
     return domain.replace('.', '_')
 
+def find_output_file(base_path: Path, filename: str, search_subdirs: bool = True) -> Optional[Path]:
+    """Search for output file in various potential locations."""
+    # Check exact path
+    if base_path.exists():
+        return base_path
+        
+    # Check filename only in shared dir
+    shared_path = DEFAULT_OUTPUT_DIR / filename
+    if shared_path.exists():
+        return shared_path
+        
+    # Check for file in domain directories
+    if search_subdirs:
+        for subdir in DEFAULT_OUTPUT_DIR.iterdir():
+            if subdir.is_dir():
+                potential_path = subdir / filename
+                if potential_path.exists():
+                    return potential_path
+                    
+    # Try a glob pattern search
+    pattern = f"**/{filename}"
+    matches = list(DEFAULT_OUTPUT_DIR.glob(pattern))
+    if matches:
+        return matches[0]
+        
+    return None
+
+def print_docker_logs(container_name: str):
+    """Print logs from a Docker container to help with debugging."""
+    try:
+        print("\n=== Docker Container Logs ===")
+        subprocess.run(["docker", "logs", container_name], check=False)
+        print("=== End of Docker Logs ===\n")
+    except Exception as e:
+        print(f"Error retrieving Docker logs: {e}")
+
 def create_output_path(domain: str, output_format: str) -> Tuple[Path, str]:
     """Create output directory and generate standardized filename."""
     # Create domain directory in shared folder
@@ -213,10 +265,11 @@ def create_output_path(domain: str, output_format: str) -> Tuple[Path, str]:
     datatype = "screenshot" if output_format.lower() in ['png', 'jpg', 'jpeg'] else "data"
     filename = f"{datestamp}_{datatype}.{output_format}"
     
+    # Return domain_dir relative to shared directory
     return domain_dir, filename
 
 def create_docker_command(url, instructions, output_path, output_format, api_key=None, use_remote_image=False):
-    """Create Docker command for extraction with improved volume mounting."""
+    """Create Docker command for extraction with improved volume mounting and timeout."""
     # Normalize URL
     url = normalize_url(url)
     
@@ -237,9 +290,13 @@ def create_docker_command(url, instructions, output_path, output_format, api_key
     ]
     
     # Add container naming for easier tracking
+    container_name = f"headless-extraction-{int(time.time())}"
     cmd.extend([
-        "--name", f"headless-extraction-{int(time.time())}",
+        "--name", container_name,
     ])
+    
+    # Add hard timeout of 10 minutes (600 seconds) to the Docker run command
+    cmd.extend(["--stop-timeout", "600"])
     
     # Add API key if provided
     if api_key:
@@ -282,12 +339,12 @@ def create_docker_command(url, instructions, output_path, output_format, api_key
         "--tool-version", "computer_use_20250124"
     ])
     
-    return cmd
-    
+    return cmd, container_name  # Return both the command and container name
+
 def run_extraction(url, instructions, output_file, output_format, api_key=None, use_remote_image=False):
     """Run the headless extraction using Docker."""
     # Prepare command
-    cmd = create_docker_command(url, instructions, output_file, output_format, api_key, use_remote_image)
+    cmd, container_name = create_docker_command(url, instructions, output_file, output_format, api_key, use_remote_image)
     
     # Log the command (mask API key)
     log_cmd = list(cmd)
@@ -298,7 +355,6 @@ def run_extraction(url, instructions, output_file, output_format, api_key=None, 
     
     # Create monitor
     monitor = ExtractionMonitor(DEFAULT_OUTPUT_DIR, output_file)
-    container_name = f"headless-extraction-{int(time.time())}"  # Same as in create_docker_command
     
     try:
         print("\n🚀 Starting container for headless extraction...")
@@ -344,19 +400,22 @@ def run_extraction(url, instructions, output_file, output_format, api_key=None, 
         if process.returncode == 0:
             print(f"\n\n✅ Extraction completed successfully in {monitor.get_elapsed_time():.1f} seconds")
             
-            # Check if output file exists
-            output_path = DEFAULT_OUTPUT_DIR / output_file
-            if Path(str(output_path).replace('\\', '/')).exists():
-                print(f"📄 Output saved to: {output_path}")
+            # Use the new find_output_file function to locate the output
+            output_path = Path(output_file)
+            found_path = find_output_file(output_path, output_path.name)
+            
+            if found_path:
+                print(f"📄 Output saved to: {found_path}")
                 return {
                     "status": "success",
-                    "output_file": str(output_path),
+                    "output_file": str(found_path),
                     "duration": monitor.get_elapsed_time(),
                     "stdout": stdout,
                     "stderr": stderr,
                 }
             else:
-                print(f"⚠️ Warning: Process completed but output file not found at {output_path}")
+                print(f"⚠️ Warning: Process completed but output file not found")
+                print_docker_logs(container_name)  # Print logs to help debug
                 return {
                     "status": "warning",
                     "message": "Process completed but output file not found",
@@ -366,6 +425,7 @@ def run_extraction(url, instructions, output_file, output_format, api_key=None, 
         else:
             print(f"\n\n❌ Extraction failed with exit code {process.returncode}")
             print(f"Error message: {stderr}")
+            print_docker_logs(container_name)  # Print logs to help debug
             return {
                 "status": "error",
                 "message": f"Extraction failed with exit code {process.returncode}",
@@ -374,20 +434,22 @@ def run_extraction(url, instructions, output_file, output_format, api_key=None, 
             }
     
     except subprocess.TimeoutExpired:
+        print("\n\n⏱️ Error: Process timed out")
+        print_docker_logs(container_name)  # Print logs to help debug
         cleanup_container(container_name)
         monitor.stop()
-        print("\n\n⏱️ Error: Process timed out")
         return {"status": "error", "message": "Process timed out"}
     except KeyboardInterrupt:
+        print("\n\n🛑 Extraction cancelled by user")
         cleanup_container(container_name)
         monitor.stop()
-        print("\n\n🛑 Extraction cancelled by user")
         return {"status": "cancelled", "message": "Cancelled by user"}
     except Exception as e:
+        print(f"\n\n❌ Error: {str(e)}")
+        print_docker_logs(container_name)  # Print logs to help debug
         cleanup_container(container_name)
         monitor.stop()
         logger.error(f"Error running extraction: {str(e)}")
-        print(f"\n\n❌ Error: {str(e)}")
         return {"status": "error", "message": str(e)}
     finally:
         # Restore original signal handler

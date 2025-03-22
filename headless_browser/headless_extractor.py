@@ -96,6 +96,13 @@ class DockerStatusUpdater(StatusUpdater):
 def verify_docker_image(image_name: str, status_updater: DockerStatusUpdater) -> bool:
     """Verify if a Docker image exists."""
     try:
+        # Check if we're running inside a Docker container by looking for .dockerenv
+        if Path('/.dockerenv').exists():
+            # We're inside Docker, assume image exists
+            logger.info("Running inside Docker container - assuming image exists")
+            return True
+        
+        # Normal verification for when not inside Docker
         result = subprocess.run(
             ["docker", "image", "inspect", image_name],
             capture_output=True,
@@ -104,6 +111,9 @@ def verify_docker_image(image_name: str, status_updater: DockerStatusUpdater) ->
         return result.returncode == 0
     except Exception as e:
         status_updater.log_docker(f"Error verifying Docker image {image_name}", "error", e)
+        # If we're in a Docker container, assume the image exists despite errors
+        if Path('/.dockerenv').exists():
+            return True
         return False
 
 def cleanup_and_rebuild_docker() -> bool:
@@ -528,22 +538,35 @@ When you're finished, explicitly state that extraction is complete and summarize
             # Create a task for the extraction
             extraction_task = asyncio.create_task(self._run_extraction())
             
-            # Wait for the task with a timeout
-            result = await asyncio.wait_for(extraction_task, timeout=MAX_EXTRACTION_TIME)
+            # Set up a timeout task
+            async def timeout_killer():
+                await asyncio.sleep(MAX_EXTRACTION_TIME)
+                if extraction_task and not extraction_task.done():
+                    logger.error(f"Extraction timed out after {MAX_EXTRACTION_TIME} seconds, forcefully terminating")
+                    self.status_updater.update_status(
+                        f"Extraction timed out after {MAX_EXTRACTION_TIME} seconds",
+                        increment_step=False,
+                        is_problem=True
+                    )
+                    extraction_task.cancel()
+                    # Optional: Force process termination as a last resort
+                    import os
+                    import signal
+                    os.kill(os.getpid(), signal.SIGTERM)
+            
+            # Start timeout task
+            timeout_task = asyncio.create_task(timeout_killer())
+            
+            # Wait for the extraction task to complete
+            result = await extraction_task
+            
+            # Cancel the timeout task since extraction completed
+            timeout_task.cancel()
+            
             return result
-        except asyncio.TimeoutError:
-            logger.error(f"Extraction timed out after {MAX_EXTRACTION_TIME} seconds")
-            self.status_updater.update_status(
-                f"Extraction timed out after {MAX_EXTRACTION_TIME} seconds",
-                increment_step=False,
-                is_problem=True
-            )
-            # Attempt to capture what was in progress
-            if self.extraction_results:
-                self.extraction_results["status"] = "timeout"
-                self.extraction_results["message"] = f"Extraction timed out after {MAX_EXTRACTION_TIME} seconds"
-                return self.extraction_results
-            return {"status": "timeout", "message": f"Extraction timed out after {MAX_EXTRACTION_TIME} seconds"}
+        except asyncio.CancelledError:
+            logger.error(f"Extraction was cancelled")
+            return {"status": "cancelled", "message": "Extraction was cancelled"}
         except Exception as e:
             # Improved error handling with more details
             import traceback

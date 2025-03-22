@@ -1,0 +1,5 @@
+{
+  "status": "error",
+  "message": "'dict' object has no attribute 'tools'",
+  "traceback": "Traceback (most recent call last):\n  File \"/home/computeruse/headless_browser/headless_extractor.py\", line 561, in run\n    result = await extraction_task\n             ^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/computeruse/headless_browser/headless_extractor.py\", line 500, in _run_extraction\n    self.messages = await sampling_loop(\n                    ^^^^^^^^^^^^^^^^^^^^\n  File \"/home/computeruse/headless_browser/loop.py\", line 92, in sampling_loop\n    tool_collection = ToolCollection(*(ToolCls() for ToolCls in tool_group.tools))\n                                                                ^^^^^^^^^^^^^^^^\nAttributeError: 'dict' object has no attribute 'tools'\n"
+}

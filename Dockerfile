@@ -110,6 +110,14 @@ RUN dos2unix $HOME/image/entrypoint.sh && \
 # Copy Python module
 COPY --chown=$USERNAME:$USERNAME headless_browser/ $HOME/headless_browser/
 
+# Add health check script
+COPY --chown=$USERNAME:$USERNAME health_check.sh $HOME/health_check.sh
+RUN chmod +x $HOME/health_check.sh
+
+# Create and configure entrypoint wrapper for health check
+RUN echo '#!/bin/bash\n$HOME/health_check.sh & \nexec "$@"\n' > $HOME/entrypoint_wrapper.sh && \
+    chmod +x $HOME/entrypoint_wrapper.sh
+
 ARG DISPLAY_NUM=1
 ARG HEIGHT=768
 ARG WIDTH=1024
@@ -117,4 +125,4 @@ ENV DISPLAY_NUM=$DISPLAY_NUM
 ENV HEIGHT=$HEIGHT
 ENV WIDTH=$WIDTH
 
-ENTRYPOINT [ "/home/computeruse/image/entrypoint.sh" ]
+ENTRYPOINT [ "/home/computeruse/entrypoint_wrapper.sh" ]
