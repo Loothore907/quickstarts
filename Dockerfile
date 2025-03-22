@@ -34,6 +34,8 @@ RUN apt-get update && \
     # Network tools
     net-tools \
     netcat \
+    # File tools
+    dos2unix \
     # PPA req
     software-properties-common && \
     # Userland apps
@@ -99,6 +101,11 @@ COPY --chown=$USERNAME:$USERNAME image/ $HOME/image/
 # Fix line endings and make scripts executable
 RUN find $HOME/image -type f -name "*.sh" -exec dos2unix {} \; && \
     chmod +x $HOME/image/*.sh
+
+# Ensure entrypoint specifically is executable with proper line endings
+RUN dos2unix $HOME/image/entrypoint.sh && \
+    chmod +x $HOME/image/entrypoint.sh && \
+    ls -la $HOME/image/entrypoint.sh
 
 # Copy Python module
 COPY --chown=$USERNAME:$USERNAME headless_browser/ $HOME/headless_browser/

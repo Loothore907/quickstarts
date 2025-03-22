@@ -8,6 +8,7 @@ import sys
 import time
 import shutil
 import threading
+import traceback
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Tuple
@@ -72,14 +73,18 @@ class LogManager:
     
     def append_to_log(self, log_name: str, content: str, domain: Optional[str] = None):
         """Append content to a log file."""
-        log_path = self.get_log_path(log_name, domain)
-        
         try:
+            log_path = self.get_log_path(log_name, domain)
+            
+            # Ensure parent directory exists
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            
             with open(log_path, 'a', encoding='utf-8') as f:
                 timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 f.write(f"[{timestamp}] {content}\n")
         except Exception as e:
-            print(f"Error writing to log {log_path}: {e}")
+            print(f"Error writing to log {log_name} for domain {domain}: {e}")
+            print(traceback.format_exc())
     
     def write_status(self, status: str, is_container: bool = True):
         """Write to status files with automatic archiving."""
@@ -89,10 +94,10 @@ class LogManager:
         status_file = self.container_status_file if is_container else self.extraction_status_file
         
         try:
-            # Ensure directory exists
-            status_file.parent.mkdir(exist_ok=True)
+            # Ensure directory exists - use absolute paths
+            status_file.parent.mkdir(exist_ok=True, parents=True)
             
-            # Write status to file
+            # Write status to file with explicit encoding
             with open(status_file, 'w', encoding='utf-8') as f:
                 f.write(f"{status}\n")
                 f.write(f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -102,7 +107,19 @@ class LogManager:
             self.append_to_log(log_name, status)
                 
         except Exception as e:
-            print(f"Error writing status: {e}")
+            print(f"Error writing status to {status_file}: {e}")
+            print(traceback.format_exc())
+            
+            # Try writing to an alternative location
+            try:
+                alt_file = self.shared_dir / "status_write_error.log"
+                with open(alt_file, 'a', encoding='utf-8') as f:
+                    f.write(f"[{datetime.now().isoformat()}] Error writing status: {e}\n")
+                    f.write(f"  - Attempted to write to: {status_file}\n")
+                    f.write(f"  - Status content: {status}\n")
+                    f.write(f"  - Traceback: {traceback.format_exc()}\n")
+            except:
+                pass
 
 class StatusUpdater:
     """
@@ -128,9 +145,14 @@ class StatusUpdater:
         self.total_steps = 5  # Approximate number of steps in extraction
         self.start_time = time.time()
         self.has_problem = False
+        self.last_update_time = time.time()
+        self.status_file = self.shared_dir / "container_status.txt"
         
         # Initialize log manager
         self.log_manager = LogManager(shared_dir)
+        
+        # Create shared directory
+        self.shared_dir.mkdir(exist_ok=True, parents=True)
         
     def start(self):
         """
@@ -139,17 +161,40 @@ class StatusUpdater:
         """
         self.running = True
         self.start_time = time.time()
-        self.thread = threading.Thread(target=self._update_loop, daemon=True)
+        self.last_update_time = time.time()
+        
+        # Create thread with exception handling
+        self.thread = threading.Thread(target=self._update_loop_with_exception_handling, daemon=True)
         self.thread.start()
         
         # Write initial status immediately and log the start
         initial_status = "Container started successfully - beginning extraction setup"
         self._write_status(initial_status)
-        self.log_manager.append_to_log(
-            "extraction_events", 
-            f"Started extraction process for domain: {self.domain or 'unknown'}", 
-            self.domain
-        )
+        
+        try:
+            self.log_manager.append_to_log(
+                "extraction_events", 
+                f"Started extraction process for domain: {self.domain or 'unknown'}", 
+                self.domain
+            )
+        except Exception as e:
+            print(f"Error logging start event: {e}")
+        
+    def _update_loop_with_exception_handling(self):
+        """Wrapper for _update_loop with exception handling."""
+        try:
+            self._update_loop()
+        except Exception as e:
+            print(f"Error in status update loop: {e}")
+            print(traceback.format_exc())
+            
+            # Try to write error to log
+            try:
+                with open(self.shared_dir / "update_loop_error.log", 'a') as f:
+                    f.write(f"[{datetime.now().isoformat()}] Error in update loop: {e}\n")
+                    f.write(f"Traceback: {traceback.format_exc()}\n")
+            except:
+                pass
         
     def stop(self):
         """
@@ -162,11 +207,14 @@ class StatusUpdater:
         
         # Log the stop event
         if self.domain:
-            self.log_manager.append_to_log(
-                "extraction_events",
-                f"Stopped extraction process for domain: {self.domain}",
-                self.domain
-            )
+            try:
+                self.log_manager.append_to_log(
+                    "extraction_events",
+                    f"Stopped extraction process for domain: {self.domain}",
+                    self.domain
+                )
+            except Exception as e:
+                print(f"Error logging stop event: {e}")
             
     def update_status(self, status: str, increment_step: bool = True, is_problem: bool = False):
         """
@@ -178,6 +226,9 @@ class StatusUpdater:
             is_problem: Whether this status represents a problem
         """
         with self.lock:
+            # Update timestamp
+            self.last_update_time = time.time()
+            
             # Format message with appropriate prefix
             if is_problem:
                 self.has_problem = True
@@ -214,23 +265,61 @@ class StatusUpdater:
         Runs in a separate thread and updates status files on a
         regular interval.
         """
+        inactivity_warning_interval = 60  # seconds
+        inactivity_warning_shown = False
+        
         while self.running:
-            with self.lock:
-                elapsed = self.get_elapsed_time()
-                progress = min(100, int((self.steps_completed / self.total_steps) * 100))
-                status = f"{self.current_status} ({progress}% complete, {elapsed:.0f}s elapsed)"
-                self._write_status(status)
+            try:
+                with self.lock:
+                    elapsed = self.get_elapsed_time()
+                    progress = min(100, int((self.steps_completed / self.total_steps) * 100))
+                    
+                    # Check for potential stalled process
+                    time_since_update = time.time() - self.last_update_time
+                    if time_since_update > inactivity_warning_interval and not inactivity_warning_shown:
+                        print(f"\n⚠️ Warning: No status updates for {time_since_update:.0f} seconds, process may be stalled")
+                        inactivity_warning_shown = True
+                    elif time_since_update < inactivity_warning_interval:
+                        inactivity_warning_shown = False
+                    
+                    status = f"{self.current_status} ({progress}% complete, {elapsed:.0f}s elapsed)"
+                    self._write_status(status)
+            except Exception as e:
+                print(f"Error in update loop iteration: {e}")
+                
             time.sleep(2)  # Update every 2 seconds
             
     def _write_status(self, status: str):
         """Write status to file and append to logs."""
         try:
-            # Write to main status file
-            self.log_manager.write_status(status, is_container=True)
+            # First, verify shared directory exists
+            self.shared_dir.mkdir(exist_ok=True, parents=True)
+            
+            # Ensure status file parent directory exists
+            self.status_file.parent.mkdir(exist_ok=True, parents=True)
+            
+            # Try writing directly to status file as a fallback
+            try:
+                with open(self.status_file, 'w', encoding='utf-8') as f:
+                    f.write(f"{status}\n")
+                    f.write(f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            except Exception as direct_write_error:
+                print(f"Direct status file write failed: {direct_write_error}")
+                # Continue to try the log manager method
+            
+            # Write to main status file through log manager
+            try:
+                self.log_manager.write_status(status, is_container=True)
+            except Exception as log_manager_error:
+                print(f"Log manager status write failed: {log_manager_error}")
+                # We already tried direct write above, so just continue
             
             # Write domain-specific log if we have a domain
             if self.domain:
-                self.log_manager.append_to_log("extraction_log", status, self.domain)
+                try:
+                    self.log_manager.append_to_log("extraction_log", status, self.domain)
+                except Exception as e:
+                    print(f"Error writing domain log: {e}")
             
             # Format output for console
             elapsed = self.get_elapsed_time()
@@ -249,4 +338,16 @@ class StatusUpdater:
             sys.stdout.flush()
             
         except Exception as e:
-            print(f"Error writing status: {e}")
+            # More robust error handling with backtrace
+            print(f"ERROR WRITING STATUS: {e}")
+            print(traceback.format_exc())
+            
+            # Try writing to alternative location
+            try:
+                error_log_path = self.shared_dir / "status_error.log"
+                with open(error_log_path, 'a', encoding='utf-8') as f:
+                    f.write(f"[{datetime.now().isoformat()}] Error writing status: {e}\n")
+                    f.write(f"  - Attempted to write: {status}\n")
+                    f.write(f"  - Traceback: {traceback.format_exc()}\n")
+            except Exception as error_log_error:
+                print(f"Failed to write error log: {error_log_error}")

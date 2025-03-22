@@ -110,91 +110,37 @@ def cleanup_and_rebuild_docker() -> bool:
     """Clean up old Docker images and rebuild the current one."""
     status = DockerStatusUpdater()
     status.start()
-    start_time = datetime.now()
     
     try:
-        status.log_docker(f"\n=== Starting Docker cleanup and rebuild at {start_time} ===")
-        
-        # Check Docker daemon
-        status.log_docker("Checking Docker daemon status...")
-        daemon_check = subprocess.run(["docker", "info"], capture_output=True, text=True)
-        if daemon_check.returncode != 0:
-            status.log_docker("Docker daemon is not running or not accessible", "error")
-            return False
-        status.log_docker("Docker daemon is running")
-        
-        # List existing images before cleanup
-        status.log_docker("Current Docker images:")
-        subprocess.run(["docker", "images"], capture_output=False)
-        
-        # Remove old images
-        status.log_docker("Removing old Docker images...")
-        for image in ["headless-browser:latest", "computer-use-demo:latest"]:
-            if verify_docker_image(image, status):
-                try:
-                    subprocess.run(
-                        ["docker", "image", "rm", image],
-                        capture_output=True,
-                        check=True,
-                        text=True
-                    )
-                    status.log_docker(f"Successfully removed {image}")
-                except subprocess.CalledProcessError as e:
-                    status.log_docker(f"Warning: Failed to remove {image}", "warning", e)
-            else:
-                status.log_docker(f"Image {image} not found, skipping removal")
-        
-        # Build new image
-        status.log_docker("Building new Docker image...")
-        build_start = time.time()
-        
-        build_process = subprocess.Popen(
-            ["docker", "build", "-t", "headless-browser", "."],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-            universal_newlines=True
+        status.log_docker("Checking if remote image exists...")
+        # Check if the remote image is available
+        remote_check = subprocess.run(
+            ["docker", "pull", "ghcr.io/anthropics/anthropic-quickstarts:computer-use-demo-latest"],
+            capture_output=True,
+            text=True
         )
         
-        # Stream build output
-        while True:
-            output = build_process.stdout.readline()
-            if output == '' and build_process.poll() is not None:
-                break
-            if output:
-                status.log_docker(output.strip(), increment_step=False)
-                
-        # Get any remaining output
-        stdout, stderr = build_process.communicate()
-        if stdout:
-            status.log_docker(stdout.strip(), increment_step=False)
-        
-        if build_process.returncode != 0:
-            if stderr:
-                status.log_docker("Error building Docker image", "error", 
-                                type('BuildError', (), {'stderr': stderr})())
-            return False
-        
-        build_time = time.time() - build_start
-        status.log_docker(f"Build completed in {build_time:.1f} seconds")
-        
-        # Verify new image
-        status.log_docker("Verifying new image...")
-        if not verify_docker_image("headless-browser:latest", status):
-            status.log_docker("Failed to verify new image", "error")
-            return False
-        
-        # Get image details
-        status.log_docker("New image details:")
-        subprocess.run(["docker", "image", "inspect", "headless-browser:latest"], capture_output=False)
-        
-        total_time = datetime.now() - start_time
-        status.log_docker(f"=== Docker cleanup and rebuild completed successfully in {total_time} ===")
-        return True
-        
+        if remote_check.returncode == 0:
+            # Tag the remote image as local for development
+            status.log_docker("Using remote image as local development image")
+            subprocess.run(
+                ["docker", "tag", 
+                 "ghcr.io/anthropics/anthropic-quickstarts:computer-use-demo-latest", 
+                 "headless-browser:latest"],
+                check=True
+            )
+            return True
+        else:
+            # Fall back to building locally only if necessary
+            status.log_docker("Remote image not available, building locally...")
+            build_process = subprocess.run(
+                ["docker", "build", "-t", "headless-browser", "."],
+                capture_output=True,
+                text=True
+            )
+            return build_process.returncode == 0
     except Exception as e:
-        status.log_docker("Unexpected error during Docker operations", "error", e)
+        status.log_docker("Error during Docker operations", "error", e)
         return False
     finally:
         status.stop()
@@ -439,11 +385,35 @@ When you're finished, explicitly state that extraction is complete and summarize
                 self.status_updater.update_status("Successfully connected to Claude API")
                 self._api_connected = True
 
-    async def run(self) -> Dict[str, Any]:
-        """Run the headless extraction process."""
-        logger.info(f"Starting headless extraction of {self.url}")
-        self.status_updater.start()
+    async def _run_extraction(self) -> Dict[str, Any]:
+        """Internal method to handle the core extraction logic."""
+        # Add inactivity monitoring
+        last_activity_time = time.time()
         
+        # Start a background task to monitor for inactivity
+        async def check_inactivity():
+            nonlocal last_activity_time
+            while True:
+                await asyncio.sleep(30)  # Check every 30 seconds
+                current_time = time.time()
+                if current_time - last_activity_time > 120:  # 2 minutes of inactivity
+                    self.status_updater.update_status(
+                        "No activity detected for 2 minutes. Claude may be stuck.", 
+                        increment_step=False,
+                        is_problem=True
+                    )
+                    # Create a help request file
+                    help_path = self.output_file.parent / "extraction_help_needed.txt"
+                    try:
+                        with open(help_path, 'w') as f:
+                            f.write("Claude needs additional instructions. Last status:\n")
+                            f.write(self.status_updater.current_status)
+                    except Exception as e:
+                        logger.error(f"Failed to write help file: {e}")
+
+        # Start inactivity monitor
+        inactivity_task = asyncio.create_task(check_inactivity())
+
         try:
             # Ensure debug directory exists and add more verbose logging
             debug_log_path = Path("/home/computeruse/shared/debug_log.txt")
@@ -482,13 +452,6 @@ When you're finished, explicitly state that extraction is complete and summarize
                 self.status_updater.update_status("Missing API key", is_problem=True)
                 raise ValueError("API key is required but not provided")
             
-            # Log successful API key check
-            try:
-                with open(debug_log_path, "a") as f:
-                    f.write("\nAPI key validation successful\n")
-            except Exception as e:
-                logger.error(f"Failed to append to debug log: {e}")
-            
             # Initialize messages with the extraction task
             self.status_updater.update_status("Building Docker container for headless extraction")
             time.sleep(2)  # Give time for status to be seen
@@ -504,14 +467,34 @@ When you're finished, explicitly state that extraction is complete and summarize
             
             # Run the sampling loop
             self.status_updater.update_status("Starting Claude extraction process")
+            
+            # Update activity time before starting sampling loop
+            last_activity_time = time.time()
+            
+            # Create a wrapper for callbacks to update activity time
+            async def output_callback_wrapper(content_block):
+                nonlocal last_activity_time
+                last_activity_time = time.time()
+                await self._output_callback(content_block)
+            
+            def tool_output_callback_wrapper(result, tool_id):
+                nonlocal last_activity_time
+                last_activity_time = time.time()
+                self._tool_output_callback(result, tool_id)
+            
+            def api_response_callback_wrapper(request, response, error):
+                nonlocal last_activity_time
+                last_activity_time = time.time()
+                self._api_response_callback(request, response, error)
+            
             self.messages = await sampling_loop(
                 model=self.model,
                 provider=self.api_provider,
                 system_prompt_suffix=self.system_prompt_suffix,
                 messages=self.messages,
-                output_callback=self._output_callback,
-                tool_output_callback=self._tool_output_callback,
-                api_response_callback=self._api_response_callback,
+                output_callback=output_callback_wrapper,
+                tool_output_callback=tool_output_callback_wrapper,
+                api_response_callback=api_response_callback_wrapper,
                 api_key=self.api_key,
                 tool_version=self.tool_version,
                 max_tokens=4096,
@@ -528,17 +511,55 @@ When you're finished, explicitly state that extraction is complete and summarize
             
             return self.extraction_results
             
-        except Exception as e:
-            error_msg = f"Error during extraction: {e}"
-            logger.error(error_msg)
+        finally:
+            # Cancel the inactivity monitor
+            inactivity_task.cancel()
+
+    async def run(self) -> Dict[str, Any]:
+        """Run the headless extraction process with robust timeout handling."""
+        logger.info(f"Starting headless extraction of {self.url}")
+        self.status_updater.start()
+        
+        # Add explicit timeout handling
+        MAX_EXTRACTION_TIME = 600  # 10 minutes
+        extraction_task = None
+        
+        try:
+            # Create a task for the extraction
+            extraction_task = asyncio.create_task(self._run_extraction())
+            
+            # Wait for the task with a timeout
+            result = await asyncio.wait_for(extraction_task, timeout=MAX_EXTRACTION_TIME)
+            return result
+        except asyncio.TimeoutError:
+            logger.error(f"Extraction timed out after {MAX_EXTRACTION_TIME} seconds")
             self.status_updater.update_status(
-                error_msg, 
+                f"Extraction timed out after {MAX_EXTRACTION_TIME} seconds",
                 increment_step=False,
                 is_problem=True
             )
-            raise
+            # Attempt to capture what was in progress
+            if self.extraction_results:
+                self.extraction_results["status"] = "timeout"
+                self.extraction_results["message"] = f"Extraction timed out after {MAX_EXTRACTION_TIME} seconds"
+                return self.extraction_results
+            return {"status": "timeout", "message": f"Extraction timed out after {MAX_EXTRACTION_TIME} seconds"}
+        except Exception as e:
+            # Improved error handling with more details
+            import traceback
+            error_msg = f"Error during extraction: {e}\n{traceback.format_exc()}"
+            logger.error(error_msg)
+            self.status_updater.update_status(
+                f"Error during extraction: {e}",
+                increment_step=False,
+                is_problem=True
+            )
+            return {"status": "error", "message": str(e), "traceback": traceback.format_exc()}
         finally:
+            # Ensure cleanup happens
             self.status_updater.stop()
+            if extraction_task and not extraction_task.done():
+                extraction_task.cancel()
 
     def _parse_extraction_results(self) -> None:
         """Parse extraction results from Claude's responses."""
